@@ -1,0 +1,8 @@
+docs/
+data/
+test/
+scripts/
+.claude/
+.claude-flow/
+.env*
+*.md

@@ -2,3 +2,9 @@ node_modules/
 data/
 .claude/
 .claude-flow/
+.env.ai
+.vercel/
+.env.turso
+
+.vercel
+.env*

@@ -51,15 +51,17 @@ export const EMAIL_RULE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 // ---------- AI via local Ollama (free, open-source models only) ----------
 export const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
 export const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
+// Shared secret for the local AI gateway (scripts/ai-tunnel.js) when Ollama is reached through a tunnel.
+const aiHeaders = () => (process.env.CCAS_AI_KEY ? { 'x-ccas-key': process.env.CCAS_AI_KEY } : {});
 
 export const COMPLAINT_CATEGORIES = {
   roads: 'ROAD', drainage: 'DRN', garbage: 'SAN', streetlight: 'ELEC', water: 'WTR', other: 'GEN',
 };
 
-async function ollamaChat(messages, { format, timeoutMs = 90000, temperature = 0.2 } = {}) {
-  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+async function ollamaChat(messages, { url = OLLAMA_URL, format, timeoutMs = 50000, temperature = 0.2 } = {}) {
+  const res = await fetch(`${url}/api/chat`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', ...aiHeaders() },
     body: JSON.stringify({ model: OLLAMA_MODEL, messages, stream: false, format, options: { temperature }, keep_alive: '30m' }),
     signal: AbortSignal.timeout(timeoutMs),
   });
@@ -80,7 +82,7 @@ export function keywordClassify(text) {
 }
 
 /** AI-based complaint classification (SRS 6.2). Falls back to keywords if Ollama is down. */
-export async function classifyComplaint(text) {
+export async function classifyComplaint(text, { url } = {}) {
   const schema = {
     type: 'object',
     properties: {
@@ -99,7 +101,7 @@ export async function classifyComplaint(text) {
         'water (drinking water supply, pipe leaks, contamination), other. ' +
         'Priority High = safety/health hazard or affects many people; Low = cosmetic. Summary: max 12 words. Reply as JSON.' },
       { role: 'user', content: text.slice(0, 2000) },
-    ], { format: schema, timeoutMs: 60000, temperature: 0 }));
+    ], { url, format: schema, timeoutMs: 45000, temperature: 0 }));
     if (!COMPLAINT_CATEGORIES[out.category]) throw new Error('bad category');
     return {
       category: out.category,
@@ -113,19 +115,19 @@ export async function classifyComplaint(text) {
 }
 
 /** Citizen help chatbot (SRS 6.4), grounded on live service data. */
-export async function chatbotReply(history, context) {
+export async function chatbotReply(history, context, { url } = {}) {
   const system =
     'You are "CCAS Sahayak", the help assistant of the City Corporation Automation System. ' +
     'Answer briefly (max 120 words) and only about municipal services. Use ONLY the facts below; ' +
     'if unsure, tell the citizen to contact the ward office. Never invent fees, dates or reference numbers.\n\n' +
     `FACTS:\n${context}\n\nHow-to: Apply = Services > Apply. Complaints = Complaints > Lodge complaint (photo optional, max 5 MB). ` +
     'Property tax = Property Tax > Pay. Track status = My Applications / Complaints. Certificates can be downloaded after approval and carry a QR code.';
-  return ollamaChat([{ role: 'system', content: system }, ...history.slice(-8)], { temperature: 0.3, timeoutMs: 120000 });
+  return ollamaChat([{ role: 'system', content: system }, ...history.slice(-8)], { url, temperature: 0.3, timeoutMs: 50000 });
 }
 
-export async function ollamaHealth() {
+export async function ollamaHealth(url = OLLAMA_URL) {
   try {
-    const r = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(3000) });
+    const r = await fetch(`${url}/api/tags`, { headers: aiHeaders(), signal: AbortSignal.timeout(5000) });
     const models = (await r.json()).models.map(m => m.name);
     return { up: true, model: OLLAMA_MODEL, modelInstalled: models.includes(OLLAMA_MODEL) };
   } catch { return { up: false, model: OLLAMA_MODEL, modelInstalled: false }; }

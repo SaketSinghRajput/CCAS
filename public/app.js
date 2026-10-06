@@ -9,7 +9,8 @@ const when = (s) => s ? new Date(s.includes('T') ? s : s.replace(' ', 'T') + 'Z'
 const day = (s) => s ? new Date(s.slice(0, 10) + 'T00:00:00').toLocaleDateString('en-IN', { dateStyle: 'medium' }) : '';
 const cap = (s) => String(s || '').replace(/^\w/, c => c.toUpperCase());
 
-const state = { token: null, user: null, services: [], wards: [], depts: [], chat: [] };
+const state = { token: null, user: null, services: [], wards: [], depts: [], chat: [], maxMb: 5 };
+const MB = 1024 * 1024;
 try { state.token = localStorage.getItem('ccas_token'); state.user = JSON.parse(localStorage.getItem('ccas_user') || 'null'); } catch { /* storage blocked */ }
 if (!state.user) state.token = null;
 
@@ -157,7 +158,7 @@ const view = (html) => { $('#view').innerHTML = html; return $('#view'); };
 const header = (title, sub, right = '') => `<div class="d-flex flex-wrap gap-2 align-items-start justify-content-between"><div><h1 class="page-title">${title}</h1><p class="page-sub">${sub}</p></div><div>${right}</div></div>`;
 
 async function loadLookups() {
-  if (!state.services.length) [state.services, state.wards, state.depts] = await Promise.all([api('/api/services'), api('/api/wards'), api('/api/departments')]);
+  if (!state.services.length) [state.services, state.wards, state.depts, { max_upload_mb: state.maxMb }] = await Promise.all([api('/api/services'), api('/api/wards'), api('/api/departments'), api('/api/config')]);
 }
 
 // ---------- public: auth ----------
@@ -351,7 +352,7 @@ route('/dashboard', null, async () => {
 route('/services', ['citizen'], async () => {
   await loadLookups();
   const icon = { BIRTH: 'balloon', DEATH: 'flower1', RESID: 'house-check', TRADE: 'shop', BPLAN: 'building', GARB: 'trash3', WCONN: 'droplet' };
-  view(`${header('Municipal services', 'Choose a service to apply online. Upload supporting documents as PDF, JPG or PNG (max 5 MB each).')}
+  view(`${header('Municipal services', `Choose a service to apply online. Upload supporting documents as PDF, JPG or PNG (max ${state.maxMb} MB each).`)}
     <div class="row g-3">${state.services.map(s => `<div class="col-md-6 col-xl-4"><div class="card p-3 h-100 d-flex flex-column">
       <div class="d-flex gap-2 align-items-center mb-2"><i class="bi bi-${icon[s.code] || 'file-earmark-text'} fs-4" style="color:var(--blue)" aria-hidden="true"></i><h2 class="h6 fw-bold mb-0">${esc(s.name)}</h2></div>
       <p class="small text-secondary flex-grow-1">${esc(s.description)}</p>
@@ -368,15 +369,16 @@ route('/apply/:id', ['citizen'], async (id) => {
       <div class="row g-3">${s.fields.map(f => `<div class="col-md-6"><label class="form-label" for="f_${f.name}">${esc(f.label)} <span class="text-danger">*</span></label>
         <input class="form-control" id="f_${f.name}" name="${f.name}" type="${f.type || 'text'}" ${f.type === 'number' ? 'min="1"' : ''} required maxlength="300"><div class="invalid-feedback">${esc(f.label)} is required.</div></div>`).join('')}
       <div class="col-12"><label class="form-label" for="docs">Supporting documents <span class="text-danger">*</span></label>
-        <input class="form-control" id="docs" type="file" multiple accept=".pdf,.jpg,.jpeg,.png" required><div class="form-text">Up to 5 files. PDF, JPG or PNG only; max 5 MB each.</div><div id="ferr" class="text-danger small" role="alert"></div></div></div>
+        <input class="form-control" id="docs" type="file" multiple accept=".pdf,.jpg,.jpeg,.png" required><div class="form-text">Up to 5 files, ${state.maxMb} MB in total. PDF, JPG or PNG only.</div><div id="ferr" class="text-danger small" role="alert"></div></div></div>
       <div class="mt-4 d-flex gap-2"><button class="btn btn-primary" id="go">Submit application</button><a class="btn btn-light" href="#/services">Cancel</a></div></form></div>`);
   $('#docs').onchange = () => {
-    const bad = [...$('#docs').files].filter(f => f.size > 5 * 1024 * 1024 || !/\.(pdf|jpe?g|png)$/i.test(f.name));
-    $('#ferr').textContent = bad.length ? `Not allowed: ${bad.map(f => f.name).join(', ')} (only PDF/JPG/PNG up to 5 MB)` : '';
+    const bad = [...$('#docs').files].filter(f => f.size > state.maxMb * MB || !/\.(pdf|jpe?g|png)$/i.test(f.name));
+    $('#ferr').textContent = bad.length ? `Not allowed: ${bad.map(f => f.name).join(', ')} (only PDF/JPG/PNG up to ${state.maxMb} MB)` : '';
   };
   $('#f').onsubmit = async (ev) => {
     ev.preventDefault();
     if (!ev.target.checkValidity()) { ev.target.classList.add('was-validated'); return toast('Please fill all required fields.', 'error'); }
+    if ([...$('#docs').files].reduce((t, f) => t + f.size, 0) > state.maxMb * MB) return toast(`Documents must be ${state.maxMb} MB in total or less.`, 'error');
     const form = new FormData();
     form.append('service_id', s.id);
     form.append('details', JSON.stringify(Object.fromEntries(s.fields.map(f => [f.name, $(`#f_${f.name}`).value]))));
@@ -586,7 +588,7 @@ route('/complaints/new', ['citizen'], async () => {
         <div class="col-12"><label class="form-label" for="location">Location / landmark <span class="text-danger">*</span></label>
           <div class="input-group"><input class="form-control" id="location" maxlength="300" required><button type="button" class="btn btn-outline-secondary" id="geo" title="Use my current location"><i class="bi bi-crosshair"></i> GPS</button></div>
           <div class="form-text" id="geotext"></div></div>
-        <div class="col-12"><label class="form-label" for="photo">Photo (optional)</label><input class="form-control" id="photo" type="file" accept=".jpg,.jpeg,.png"><div class="form-text">JPG or PNG, max 5 MB.</div></div></div>
+        <div class="col-12"><label class="form-label" for="photo">Photo (optional)</label><input class="form-control" id="photo" type="file" accept=".jpg,.jpeg,.png"><div class="form-text">JPG or PNG, max ${state.maxMb} MB.</div></div></div>
       <div class="mt-4"><button class="btn btn-primary" id="go">Submit complaint</button></div></form></div></div>
       <div class="col-lg-4"><div class="card p-3"><h2 class="h6 fw-bold">What happens next</h2><ul class="timeline mt-2">${['Complaint ID generated and acknowledgement sent', 'Routed to the concerned department', 'Officer assigns field staff', 'Field staff resolves and uploads proof', 'You are notified at every step'].map(s => `<li><span class="dot"></span><span class="small">${s}</span></li>`).join('')}</ul></div></div></div>`);
   let coords = null;
@@ -609,7 +611,7 @@ route('/complaints/new', ['citizen'], async () => {
     ev.preventDefault();
     if (!ev.target.checkValidity()) { ev.target.classList.add('was-validated'); return toast('Please fill the required fields (description of at least 10 characters and location).', 'error'); }
     const f = $('#photo').files[0];
-    if (f && (f.size > 5 * 1024 * 1024 || !/\.(jpe?g|png)$/i.test(f.name))) return toast('Photo must be JPG/PNG and at most 5 MB.', 'error');
+    if (f && (f.size > state.maxMb * MB || !/\.(jpe?g|png)$/i.test(f.name))) return toast(`Photo must be JPG/PNG and at most ${state.maxMb} MB.`, 'error');
     const form = new FormData();
     form.append('description', $('#description').value); form.append('location', $('#location').value);
     form.append('category', $('#category').value); form.append('ward_id', $('#ward').value);

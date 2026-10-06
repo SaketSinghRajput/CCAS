@@ -1,21 +1,54 @@
-// ponytail: node:sqlite stands in for MySQL 8 so the prototype runs with zero setup.
-// The schema is plain SQL (3NF, FKs); swap to mysql2 with the same queries for production.
-import { DatabaseSync } from 'node:sqlite';
+// Data layer on libSQL: a local SQLite file in development, Turso (hosted libSQL) in production.
+// Same SQL either way; uploaded documents are stored as BLOBs so serverless hosts need no disk.
+import { createClient } from '@libsql/client';
 import fs from 'node:fs';
 import path from 'node:path';
 import { hashPassword } from './lib.js';
 
 export const DATA_DIR = process.env.CCAS_DATA_DIR || path.resolve('data');
-export const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 
-export function openDb(file = path.join(DATA_DIR, 'ccas.db')) {
-  if (file !== ':memory:') fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-  const db = new DatabaseSync(file);
-  db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;');
-  db.exec(SCHEMA);
-  if (!db.prepare('SELECT 1 FROM users LIMIT 1').get()) seed(db);
+const toRows = (rs) => rs.rows.map(r => Object.fromEntries(rs.columns.map((c, i) => [c, r[i] instanceof ArrayBuffer ? Buffer.from(r[i]) : r[i]])));
+const norm = (a) => a.map(v => v === undefined ? null : typeof v === 'boolean' ? Number(v) : v);
+
+// q = all rows, one = first row, run = write (returns changes + lastInsertRowid)
+function api(exec) {
+  return {
+    q: async (sql, ...a) => toRows(await exec({ sql, args: norm(a) })),
+    one: async (sql, ...a) => toRows(await exec({ sql, args: norm(a) }))[0],
+    run: async (sql, ...a) => { const r = await exec({ sql, args: norm(a) }); return { changes: r.rowsAffected, lastInsertRowid: Number(r.lastInsertRowid) }; },
+  };
+}
+
+export function openDb(url = process.env.TURSO_DATABASE_URL, authToken = process.env.TURSO_AUTH_TOKEN) {
+  if (!url) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    url = 'file:' + path.join(DATA_DIR, 'ccas.db').replace(/\\/g, '/');
+  }
+  const client = createClient({ url, authToken });
+  let ready = null;
+  const init = () => (ready ??= initDb(client).catch((e) => { ready = null; throw e; }));
+  const db = api(async (stmt) => { await init(); return client.execute(stmt); });
+  db.tx = async (fn) => {
+    await init();
+    const t = await client.transaction('write');
+    try { const r = await fn(api((s) => t.execute(s))); await t.commit(); return r; }
+    catch (e) { await t.rollback().catch(() => {}); throw e; }
+    finally { t.close(); }
+  };
+  db.ready = init;
+  db.close = () => client.close();
   return db;
+}
+
+async function initDb(client) {
+  await client.batch(SCHEMA.split(';').map(s => s.trim()).filter(Boolean), 'write');
+  const t = await client.transaction('write');
+  try {
+    const tx = api((s) => t.execute(s));
+    if (!(await tx.one('SELECT 1 AS x FROM users LIMIT 1'))) await seed(tx);
+    await t.commit();
+  } catch (e) { await t.rollback().catch(() => {}); throw e; }
+  finally { t.close(); }
 }
 
 const SCHEMA = `
@@ -47,8 +80,9 @@ CREATE TABLE IF NOT EXISTS application_history (
 CREATE TABLE IF NOT EXISTS documents (
   id INTEGER PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id),
   owner_type TEXT NOT NULL, owner_id INTEGER, label TEXT, original_name TEXT NOT NULL,
-  stored_name TEXT NOT NULL, mime TEXT NOT NULL, size INTEGER NOT NULL,
+  mime TEXT NOT NULL, size INTEGER NOT NULL, data BLOB NOT NULL,
   created_at TEXT NOT NULL DEFAULT (datetime('now')));
+CREATE INDEX IF NOT EXISTS documents_owner ON documents (owner_type, owner_id);
 CREATE TABLE IF NOT EXISTS complaints (
   id INTEGER PRIMARY KEY, ref_no TEXT UNIQUE NOT NULL, user_id INTEGER NOT NULL REFERENCES users(id),
   category TEXT NOT NULL, description TEXT NOT NULL, location TEXT NOT NULL, ward_id INTEGER REFERENCES wards(id),
@@ -89,20 +123,20 @@ CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 `;
 
 export const DEMO_PASSWORD = 'Demo@1234';
+export const NUMERIC_SETTINGS = ['tax_rate_residential', 'tax_rate_commercial', 'water_charge_per_sqft', 'penalty_rate_monthly', 'penalty_cap'];
 
-function seed(db) {
+async function seed(db) {
   const depts = [
     ['REG', 'Birth & Death Registration'], ['LIC', 'Trade Licensing'], ['BLD', 'Building & Planning'],
     ['REV', 'Revenue (Property Tax)'], ['ROAD', 'Roads & Engineering'], ['DRN', 'Drainage & Sewerage'],
     ['SAN', 'Sanitation & Solid Waste'], ['ELEC', 'Street Lighting'], ['WTR', 'Water Supply'], ['GEN', 'Public Grievance Cell'],
   ];
-  const insD = db.prepare('INSERT INTO departments (code, name) VALUES (?, ?)');
-  for (const d of depts) insD.run(...d);
-  const dept = Object.fromEntries(db.prepare('SELECT code, id FROM departments').all().map(r => [r.code, r.id]));
-  for (let i = 1; i <= 6; i++) db.prepare('INSERT INTO wards (name) VALUES (?)').run(`Ward ${i}`);
+  for (const d of depts) await db.run('INSERT INTO departments (code, name) VALUES (?, ?)', ...d);
+  const dept = Object.fromEntries((await db.q('SELECT code, id FROM departments')).map(r => [r.code, r.id]));
+  for (let i = 1; i <= 6; i++) await db.run('INSERT INTO wards (name) VALUES (?)', `Ward ${i}`);
 
   const settings = { tax_rate_residential: '0.10', tax_rate_commercial: '0.15', water_charge_per_sqft: '1.5', penalty_rate_monthly: '0.02', penalty_cap: '0.24' };
-  for (const [k, v] of Object.entries(settings)) db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)').run(k, v);
+  for (const [k, v] of Object.entries(settings)) await db.run('INSERT INTO settings (key, value) VALUES (?, ?)', k, v);
 
   const F = (...f) => JSON.stringify(f);
   const services = [
@@ -121,11 +155,10 @@ function seed(db) {
     ['WCONN', 'New Water Connection', 'Apply for a new domestic water connection.', 'WTR', 1500, 15,
       F({ name: 'connection_address', label: 'Connection address' }, { name: 'connection_size', label: 'Pipe size (mm)', type: 'number' })],
   ];
-  const insS = db.prepare('INSERT INTO services (code, name, description, department_id, fee, sla_days, fields) VALUES (?,?,?,?,?,?,?)');
-  for (const [c, n, d, dep, fee, sla, f] of services) insS.run(c, n, d, dept[dep], fee, sla, f);
+  for (const [c, n, d, dep, fee, sla, f] of services)
+    await db.run('INSERT INTO services (code, name, description, department_id, fee, sla_days, fields) VALUES (?,?,?,?,?,?,?)', c, n, d, dept[dep], fee, sla, f);
 
   const hash = hashPassword(DEMO_PASSWORD);
-  const insU = db.prepare('INSERT INTO users (name, email, mobile, address, password_hash, role, department_id, verified) VALUES (?,?,?,?,?,?,?,1)');
   const users = [
     ['Riya Sharma', 'citizen@ccas.gov', '9876500001', '12 Lake Road, Ward 2', 'citizen', null],
     ['Arjun Patel', 'citizen2@ccas.gov', '9876500002', '44 Station Street, Ward 4', 'citizen', null],
@@ -136,36 +169,43 @@ function seed(db) {
     ['Field Staff Kavya', 'field2@ccas.gov', '9876500021', 'Depot 2', 'field', dept.SAN],
     ['Admin Anil Kumar', 'admin@ccas.gov', '9876500099', 'Head Office', 'admin', null],
   ];
-  for (const [n, e, m, a, r, d] of users) insU.run(n, e, m, a, hash, r, d);
-  const uid = Object.fromEntries(db.prepare('SELECT email, id FROM users').all().map(r => [r.email, r.id]));
+  for (const [n, e, m, a, r, d] of users)
+    await db.run('INSERT INTO users (name, email, mobile, address, password_hash, role, department_id, verified) VALUES (?,?,?,?,?,?,?,1)', n, e, m, a, hash, r, d);
+  const uid = Object.fromEntries((await db.q('SELECT email, id FROM users')).map(r => [r.email, r.id]));
 
-  const insP = db.prepare('INSERT INTO properties (property_no, owner_id, address, ward_id, usage, area_sqft, annual_value) VALUES (?,?,?,?,?,?,?)');
-  insP.run('PRP-W2-0012', uid['citizen@ccas.gov'], '12 Lake Road', 2, 'Residential', 1200, 96000);
-  insP.run('PRP-W2-0019', uid['citizen@ccas.gov'], 'Shop 3, Market Complex', 2, 'Commercial', 400, 72000);
-  insP.run('PRP-W4-0044', uid['citizen2@ccas.gov'], '44 Station Street', 4, 'Residential', 900, 60000);
+  const props = [
+    ['PRP-W2-0012', uid['citizen@ccas.gov'], '12 Lake Road', 2, 'Residential', 1200, 96000],
+    ['PRP-W2-0019', uid['citizen@ccas.gov'], 'Shop 3, Market Complex', 2, 'Commercial', 400, 72000],
+    ['PRP-W4-0044', uid['citizen2@ccas.gov'], '44 Station Street', 4, 'Residential', 900, 60000],
+  ];
+  for (const p of props) await db.run('INSERT INTO properties (property_no, owner_id, address, ward_id, usage, area_sqft, annual_value) VALUES (?,?,?,?,?,?,?)', ...p);
 
   const year = new Date().getFullYear();
-  const insB = db.prepare('INSERT INTO tax_bills (property_id, year, tax_amount, water_charge, due_date, status) VALUES (?,?,?,?,?,?)');
-  for (const p of db.prepare('SELECT * FROM properties').all()) {
-    const { tax, water } = computeTax(p, db);
-    insB.run(p.id, `${year - 1}-${String(year).slice(2)}`, tax, water, `${year}-03-31`, p.id === 3 ? 'Paid' : 'Unpaid');
-    insB.run(p.id, `${year}-${String(year + 1).slice(2)}`, tax, water, `${year + 1}-03-31`, 'Unpaid');
+  const rates = await taxRates(db);
+  for (const p of await db.q('SELECT * FROM properties')) {
+    const { tax, water } = computeTax(p, rates);
+    await db.run('INSERT INTO tax_bills (property_id, year, tax_amount, water_charge, due_date, status) VALUES (?,?,?,?,?,?)',
+      p.id, `${year - 1}-${String(year).slice(2)}`, tax, water, `${year}-03-31`, p.property_no === 'PRP-W4-0044' ? 'Paid' : 'Unpaid');
+    await db.run('INSERT INTO tax_bills (property_id, year, tax_amount, water_charge, due_date, status) VALUES (?,?,?,?,?,?)',
+      p.id, `${year}-${String(year + 1).slice(2)}`, tax, water, `${year + 1}-03-31`, 'Unpaid');
   }
 
-  db.prepare('INSERT INTO announcements (title, body, deadline) VALUES (?,?,?)').run(
+  await db.run('INSERT INTO announcements (title, body, deadline) VALUES (?,?,?)',
     'Property tax due date', 'Pay your current-year property tax before the due date to avoid a 2% monthly penalty.', `${year + 1}-03-31`);
-  db.prepare('INSERT INTO announcements (title, body, deadline) VALUES (?,?,?)').run(
+  await db.run('INSERT INTO announcements (title, body, deadline) VALUES (?,?,?)',
     'Monsoon drain cleaning drive', 'Report blocked drains in your ward through the Complaints section.', null);
 }
 
-export function setting(db, key) {
-  return Number(db.prepare('SELECT value FROM settings WHERE key = ?').get(key)?.value);
+/** All numeric tax/penalty settings in one query. */
+export async function taxRates(db) {
+  const rows = await db.q(`SELECT key, value FROM settings WHERE key IN (${NUMERIC_SETTINGS.map(() => '?').join(',')})`, ...NUMERIC_SETTINGS);
+  return Object.fromEntries(rows.map(r => [r.key, Number(r.value)]));
 }
 
-export function computeTax(property, db) {
-  const rate = setting(db, property.usage === 'Commercial' ? 'tax_rate_commercial' : 'tax_rate_residential');
+export function computeTax(property, rates) {
+  const rate = property.usage === 'Commercial' ? rates.tax_rate_commercial : rates.tax_rate_residential;
   return {
     tax: Math.round(property.annual_value * rate * 100) / 100,
-    water: Math.round(property.area_sqft * setting(db, 'water_charge_per_sqft') * 100) / 100,
+    water: Math.round(property.area_sqft * rates.water_charge_per_sqft * 100) / 100,
   };
 }

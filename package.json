@@ -7,14 +7,20 @@
   "scripts": {
     "start": "node src/server.js",
     "reset": "node -e \"require('fs').rmSync('data',{recursive:true,force:true})\" && node src/server.js",
-    "test": "node --test \"test/*.test.js\""
+    "test": "node --test \"test/*.test.js\"",
+    "ai-tunnel": "node --env-file=.env.ai scripts/ai-tunnel.js",
+    "reset:live": "node --env-file=.env.turso scripts/reset-db.js"
   },
   "engines": {
-    "node": ">=22.13"
+    "node": ">=22"
   },
   "dependencies": {
+    "@libsql/client": "^0.18.0",
     "express": "^5.2.1",
     "multer": "^2.4.0",
     "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "cloudflared": "^0.7.3"
   }
 }

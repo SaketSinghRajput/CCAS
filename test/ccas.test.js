@@ -8,6 +8,7 @@ import path from 'node:path';
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ccas-test-'));
 process.env.CCAS_DATA_DIR = dir;
 process.env.NODE_ENV = 'test';
+process.env.CCAS_AI_KEY = 'test-ai-key-0123456789';
 const { openDb } = await import('../src/db.js');
 const { createApp } = await import('../src/server.js');
 const { penaltyFor, keywordClassify, classifyComplaint, ollamaHealth, signJwt, verifyJwt } = await import('../src/lib.js');
@@ -17,7 +18,7 @@ let server, base, db;
 const stubClassify = async (t) => ({ category: keywordClassify(t), priority: 'High', summary: 'stub', source: 'stub' });
 
 before(async () => {
-  db = openDb(path.join(dir, 'test.db'));
+  db = openDb('file:' + path.join(dir, 'test.db').split(path.sep).join('/'));
   const app = createApp(db, { secret: 'test-secret', classify: stubClassify, chat: async () => 'Birth certificate fee is Rs 50.' });
   server = app.listen(0);
   await new Promise(r => server.once('listening', r));
@@ -302,6 +303,19 @@ test('admin: create employee, add service, generate bills, settings', async () =
   assert.equal((await api('POST', '/api/admin/bills/generate', { token: admin, body: { year: '2030-31', due_date: '2031-03-31' } })).data.created, 0);
   assert.equal((await api('PUT', '/api/admin/settings', { token: admin, body: { penalty_rate_monthly: 'abc' } })).status, 400);
   assert.equal((await api('PUT', '/api/admin/settings', { token: admin, body: { penalty_rate_monthly: '0.02' } })).status, 200);
+});
+
+test('AI endpoint registration requires the shared key and a safe URL', async () => {
+  const post = (key, url) => fetch(`${base}/api/ai/endpoint`, { method: 'POST', headers: { 'content-type': 'application/json', ...(key && { 'x-ccas-key': key }) }, body: JSON.stringify({ url }) });
+  assert.equal((await post(null, 'https://abc.trycloudflare.com')).status, 403);
+  assert.equal((await post('wrong-key-wrong-key-xx', 'https://abc.trycloudflare.com')).status, 403);
+  assert.equal((await post(process.env.CCAS_AI_KEY, 'http://evil.example.com')).status, 400);
+  assert.equal((await post(process.env.CCAS_AI_KEY, 'http://127.0.0.1:11434')).status, 200);
+  assert.equal((await db.one("SELECT value FROM settings WHERE key = 'ai_url'")).value, 'http://127.0.0.1:11434');
+  // ai_url is not exposed/editable through the numeric tax settings
+  const admin = await login('admin@ccas.gov');
+  assert.ok(!('ai_url' in (await api('GET', '/api/admin/settings', { token: admin })).data));
+  assert.equal((await api('PUT', '/api/admin/settings', { token: admin, body: { ai_url: 'x' } })).status, 400);
 });
 
 test('JWT: tampered or expired tokens are rejected', () => {
